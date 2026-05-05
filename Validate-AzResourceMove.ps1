@@ -90,6 +90,47 @@ else {
 }
 
 # -----------------------------------------------------------------------------
+# 4b. Filter out child resources
+#     Azure requires only top-level resources in the move/validate request.
+#     A top-level resource ID has exactly ONE type/name pair after /providers/:
+#       .../providers/Microsoft.Compute/virtualMachines/myVM          <- TOP-LEVEL (keep)
+#       .../providers/Microsoft.Compute/virtualMachines/myVM/extensions/myExt <- CHILD (skip)
+#     Detection: after splitting on '/', the segment count after the provider
+#     namespace is 2 (type + name) for top-level, 4+ for children.
+# -----------------------------------------------------------------------------
+function Test-IsTopLevelResource {
+    param([string]$ResourceId)
+    # Split on '/' and find the index of 'providers'
+    $parts = $ResourceId.ToLower() -split '/'
+    $providerIndex = [Array]::IndexOf($parts, 'providers')
+    if ($providerIndex -lt 0) { return $false }
+    # Segments after 'providers': namespace, type, name = 3 for top-level
+    # Child resources add extra type/name pairs, so segment count > 3
+    $afterProvider = $parts.Count - $providerIndex - 1
+    return $afterProvider -le 3
+}
+
+$allCount      = $ResourceIds.Count
+$topLevelIds   = @($ResourceIds | Where-Object { Test-IsTopLevelResource $_ })
+$childSkipped  = $allCount - $topLevelIds.Count
+
+if ($childSkipped -gt 0) {
+    Write-Status "$childSkipped child resource(s) removed from the request (they move automatically with their parent)." "WARNING"
+    $skipped = $ResourceIds | Where-Object { -not (Test-IsTopLevelResource $_) }
+    foreach ($s in $skipped) {
+        Write-Host "  Skipped (child): $s" -ForegroundColor DarkYellow
+    }
+}
+
+if ($topLevelIds.Count -eq 0) {
+    Write-Status "No top-level resources remain after filtering. Nothing to validate." "WARNING"
+    exit 0
+}
+
+$ResourceIds = $topLevelIds
+Write-Status "$($ResourceIds.Count) top-level resource(s) will be validated." "SUCCESS"
+
+# -----------------------------------------------------------------------------
 # 5. Resolve the target subscription
 # -----------------------------------------------------------------------------
 if (-not $TargetSubscriptionId) {
