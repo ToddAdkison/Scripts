@@ -74,7 +74,7 @@ Write-Status "Context set successfully." "SUCCESS"
 # 4. Build the list of resource IDs to validate
 # -----------------------------------------------------------------------------
 if (-not $ResourceIds -or $ResourceIds.Count -eq 0) {
-    Write-Status "No specific resources provided — retrieving all resources in '$SourceResourceGroupName'..."
+    Write-Status "No specific resources provided - retrieving all resources in '$SourceResourceGroupName'..."
     $resources = Get-AzResource -ResourceGroupName $SourceResourceGroupName -ErrorAction Stop
 
     if (-not $resources -or $resources.Count -eq 0) {
@@ -94,7 +94,7 @@ else {
 # -----------------------------------------------------------------------------
 if (-not $TargetSubscriptionId) {
     $TargetSubscriptionId = $SourceSubscriptionId
-    Write-Status "No target subscription specified — defaulting to source subscription." "WARNING"
+    Write-Status "No target subscription specified - defaulting to source subscription." "WARNING"
 }
 
 # -----------------------------------------------------------------------------
@@ -116,7 +116,7 @@ $sourceRgResourceId = "/subscriptions/$SourceSubscriptionId/resourceGroups/$Sour
 # -----------------------------------------------------------------------------
 # 8. Invoke the validation action
 # -----------------------------------------------------------------------------
-Write-Status "Invoking validateMoveResources action — this may take up to 15 minutes for large moves..."
+Write-Status "Invoking validateMoveResources action - this may take up to 15 minutes for large moves..."
 
 try {
     $result = Invoke-AzResourceAction `
@@ -128,7 +128,7 @@ try {
         -ErrorAction   Stop
 
     # A 204 No Content response means the validation passed with no issues.
-    Write-Status "Validation completed successfully — all resources are eligible to move." "SUCCESS"
+    Write-Status "Validation completed successfully - all resources are eligible to move." "SUCCESS"
     Write-Output $result
 }
 catch {
