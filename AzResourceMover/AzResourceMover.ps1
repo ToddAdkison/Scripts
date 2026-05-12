@@ -1,219 +1,456 @@
 # =============================================================================
-# Validate-AzResourceMove.ps1
-# Validates whether Azure resources can be moved to a target subscription/RG
-# using Invoke-AzResourceAction -Action validateMoveResources
+# AzResourceMover.ps1
+#
+# USAGE:
+#   .\AzResourceMover.ps1 -Function Validate -SourceSubscriptionId <id> `
+#       -SourceResourceGroupName <rg> -TargetResourceGroupId <id>
+#
+#   .\AzResourceMover.ps1 -Function Move -SourceSubscriptionId <id> `
+#       -SourceResourceGroupName <rg> -TargetResourceGroupId <id>
+#
+#   .\AzResourceMover.ps1 -Function Copy -SourceSubscriptionId <id> `
+#       -SourceResourceGroupName <rg> [-OutputPath .\MyExport]
+#
+# FUNCTIONS:
+#   Validate  - Validates resources are eligible for a move (no changes made)
+#   Move      - Validates then moves resources to the target resource group
+#   Copy      - Exports resource group as ARM JSON and decompiles to Bicep
 # =============================================================================
 
 [CmdletBinding()]
 param (
-    [Parameter(Mandatory = $true, HelpMessage = "Subscription ID containing the source resources")]
+    # ---- Which function to run ----
+    [Parameter(Mandatory = $true, Position = 0)]
+    [ValidateSet("Validate", "Move", "Copy")]
+    [string]$Function,
+
+    # ---- Shared parameters ----
+    [Parameter(Mandatory = $true)]
     [string]$SourceSubscriptionId,
 
-    [Parameter(Mandatory = $true, HelpMessage = "Source Resource Group name")]
+    [Parameter(Mandatory = $true)]
     [string]$SourceResourceGroupName,
 
-    [Parameter(Mandatory = $true, HelpMessage = "Target Resource Group resource ID")]
+    # Required for Validate and Move; not needed for Copy
+    [Parameter(Mandatory = $false)]
     [string]$TargetResourceGroupId,
 
-    [Parameter(Mandatory = $false, HelpMessage = "Target Subscription ID (defaults to source if not provided)")]
+    [Parameter(Mandatory = $false)]
     [string]$TargetSubscriptionId,
 
-    [Parameter(Mandatory = $false, HelpMessage = "Specific resource IDs to validate (if empty, all resources in the RG are used)")]
-    [string[]]$ResourceIds
+    [Parameter(Mandatory = $false)]
+    [string[]]$ResourceIds,
+
+    # ---- Copy-specific parameters ----
+    [Parameter(Mandatory = $false)]
+    [string]$OutputPath = ".\AzExport",
+
+    # Skip the confirmation prompt on Move (use in automation)
+    [Parameter(Mandatory = $false)]
+    [switch]$Force
 )
 
-# -----------------------------------------------------------------------------
-# Helper: Write coloured status messages
-# -----------------------------------------------------------------------------
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+# =============================================================================
+# SHARED HELPERS
+# =============================================================================
+
 function Write-Status {
     param([string]$Message, [string]$Level = "INFO")
     $colour = switch ($Level) {
-        "INFO"    { "Cyan" }
-        "SUCCESS" { "Green" }
+        "INFO"    { "Cyan"   }
+        "SUCCESS" { "Green"  }
         "WARNING" { "Yellow" }
-        "ERROR"   { "Red" }
-        default   { "White" }
+        "ERROR"   { "Red"    }
+        default   { "White"  }
     }
     Write-Host "[$Level] $Message" -ForegroundColor $colour
 }
 
-# -----------------------------------------------------------------------------
-# 1. Verify the Az module is available
-# -----------------------------------------------------------------------------
-Write-Status "Checking for Az.Resources module..."
-if (-not (Get-Module -ListAvailable -Name Az.Resources)) {
-    Write-Status "Az.Resources module not found. Install with: Install-Module -Name Az -Scope CurrentUser" "ERROR"
-    exit 1
+function Write-Banner {
+    param([string]$Title)
+    $line = "-" * ($Title.Length + 6)
+    Write-Host ""
+    Write-Host $line            -ForegroundColor DarkGray
+    Write-Host "   $Title   "  -ForegroundColor White
+    Write-Host $line            -ForegroundColor DarkGray
+    Write-Host ""
 }
 
-Import-Module Az.Resources -ErrorAction Stop
-Write-Status "Az.Resources module loaded." "SUCCESS"
-
-# -----------------------------------------------------------------------------
-# 2. Ensure an active Azure session exists
-# -----------------------------------------------------------------------------
-Write-Status "Verifying Azure login context..."
-$context = Get-AzContext -ErrorAction SilentlyContinue
-
-if (-not $context -or -not $context.Account) {
-    Write-Status "No active Azure session found. Launching interactive login..." "WARNING"
-    Connect-AzAccount -ErrorAction Stop
-    $context = Get-AzContext
-}
-
-Write-Status "Logged in as: $($context.Account.Id)" "SUCCESS"
-
-# -----------------------------------------------------------------------------
-# 3. Set the source subscription context
-# -----------------------------------------------------------------------------
-Write-Status "Setting context to source subscription: $SourceSubscriptionId"
-Set-AzContext -SubscriptionId $SourceSubscriptionId -ErrorAction Stop | Out-Null
-Write-Status "Context set successfully." "SUCCESS"
-
-# -----------------------------------------------------------------------------
-# 4. Build the list of resource IDs to validate
-# -----------------------------------------------------------------------------
-if (-not $ResourceIds -or $ResourceIds.Count -eq 0) {
-    Write-Status "No specific resources provided - retrieving all resources in '$SourceResourceGroupName'..."
-    $resources = Get-AzResource -ResourceGroupName $SourceResourceGroupName -ErrorAction Stop
-
-    if (-not $resources -or $resources.Count -eq 0) {
-        Write-Status "No resources found in resource group '$SourceResourceGroupName'." "WARNING"
-        exit 0
+function Assert-Module {
+    param([string]$ModuleName)
+    if (-not (Get-Module -ListAvailable -Name $ModuleName)) {
+        Write-Status "$ModuleName module not found. Install with: Install-Module -Name Az -Scope CurrentUser" "ERROR"
+        exit 1
     }
-
-    $ResourceIds = $resources | Select-Object -ExpandProperty ResourceId
-    Write-Status "Found $($ResourceIds.Count) resource(s) to validate." "SUCCESS"
-}
-else {
-    Write-Status "Using $($ResourceIds.Count) explicitly provided resource ID(s)."
+    Import-Module $ModuleName -ErrorAction Stop
 }
 
-# -----------------------------------------------------------------------------
-# 4b. Filter out child resources
-#     Azure requires only top-level resources in the move/validate request.
-#     A top-level resource ID has exactly ONE type/name pair after /providers/:
-#       .../providers/Microsoft.Compute/virtualMachines/myVM          <- TOP-LEVEL (keep)
-#       .../providers/Microsoft.Compute/virtualMachines/myVM/extensions/myExt <- CHILD (skip)
-#     Detection: after splitting on '/', the segment count after the provider
-#     namespace is 2 (type + name) for top-level, 4+ for children.
-# -----------------------------------------------------------------------------
-function Test-IsTopLevelResource {
-    param([string]$ResourceId)
-    # Split on '/' and find the index of 'providers'
-    $parts = $ResourceId.ToLower() -split '/'
-    $providerIndex = [Array]::IndexOf($parts, 'providers')
-    if ($providerIndex -lt 0) { return $false }
-    # Segments after 'providers': namespace, type, name = 3 for top-level
-    # Child resources add extra type/name pairs, so segment count > 3
-    $afterProvider = $parts.Count - $providerIndex - 1
-    return $afterProvider -le 3
-}
-
-$allCount      = $ResourceIds.Count
-$topLevelIds   = @($ResourceIds | Where-Object { Test-IsTopLevelResource $_ })
-$childSkipped  = $allCount - $topLevelIds.Count
-
-if ($childSkipped -gt 0) {
-    Write-Status "$childSkipped child resource(s) removed from the request (they move automatically with their parent)." "WARNING"
-    $skipped = $ResourceIds | Where-Object { -not (Test-IsTopLevelResource $_) }
-    foreach ($s in $skipped) {
-        Write-Host "  Skipped (child): $s" -ForegroundColor DarkYellow
-    }
-}
-
-if ($topLevelIds.Count -eq 0) {
-    Write-Status "No top-level resources remain after filtering. Nothing to validate." "WARNING"
-    exit 0
-}
-
-$ResourceIds = $topLevelIds
-Write-Status "$($ResourceIds.Count) top-level resource(s) will be validated." "SUCCESS"
-
-# -----------------------------------------------------------------------------
-# 5. Resolve the target subscription
-# -----------------------------------------------------------------------------
-if (-not $TargetSubscriptionId) {
-    $TargetSubscriptionId = $SourceSubscriptionId
-    Write-Status "No target subscription specified - defaulting to source subscription." "WARNING"
-}
-
-# -----------------------------------------------------------------------------
-# 6. Build the request payload
-# -----------------------------------------------------------------------------
-$movePayload = @{
-    resources           = @($ResourceIds)
-    targetResourceGroup = $TargetResourceGroupId
-}
-
-Write-Status "Validation payload:"
-Write-Host ($movePayload | ConvertTo-Json -Depth 5) -ForegroundColor DarkGray
-
-# -----------------------------------------------------------------------------
-# 7. Build the source Resource Group resource ID (needed by the cmdlet)
-# -----------------------------------------------------------------------------
-$sourceRgResourceId = "/subscriptions/$SourceSubscriptionId/resourceGroups/$SourceResourceGroupName"
-
-# -----------------------------------------------------------------------------
-# 8. Invoke the validation action
-# -----------------------------------------------------------------------------
-Write-Status "Invoking validateMoveResources action - this may take up to 15 minutes for large moves..."
-
-try {
-    $result = Invoke-AzResourceAction `
-        -ResourceId    $sourceRgResourceId `
-        -Action        "validateMoveResources" `
-        -Parameters    $movePayload `
-        -ApiVersion    "2021-04-01" `
-        -Force `
-        -ErrorAction   Stop
-
-    # A 204 No Content response means the validation passed with no issues.
-    Write-Status "Validation completed successfully - all resources are eligible to move." "SUCCESS"
-    Write-Output $result
-}
-catch {
-    $errMsg = $_.Exception.Message
-
-    # Parse the inner error body if present
-    if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
-        try {
-            $errBody = $_.ErrorDetails.Message | ConvertFrom-Json
-            Write-Status "Validation FAILED. Azure error details:" "ERROR"
-
-            # Surface each per-resource error
-            if ($errBody.error.details) {
-                foreach ($detail in $errBody.error.details) {
-                    Write-Host "  Resource : $($detail.target)"   -ForegroundColor Red
-                    Write-Host "  Code     : $($detail.code)"     -ForegroundColor Red
-                    Write-Host "  Message  : $($detail.message)"  -ForegroundColor Red
-                    Write-Host ""
-                }
-            }
-            else {
-                Write-Host "  Code    : $($errBody.error.code)"    -ForegroundColor Red
-                Write-Host "  Message : $($errBody.error.message)" -ForegroundColor Red
-            }
-        }
-        catch {
-            Write-Status "Validation FAILED. Raw error: $errMsg" "ERROR"
-        }
+function Connect-IfNeeded {
+    $ctx = Get-AzContext -ErrorAction SilentlyContinue
+    if (-not $ctx -or -not $ctx.Account) {
+        Write-Status "No active Azure session found. Launching interactive login..." "WARNING"
+        Connect-AzAccount -ErrorAction Stop
     }
     else {
-        Write-Status "Validation FAILED. Error: $errMsg" "ERROR"
+        Write-Status "Logged in as: $((Get-AzContext).Account.Id)" "SUCCESS"
     }
-
-    exit 1
 }
 
-# -----------------------------------------------------------------------------
-# 9. Summary
-# -----------------------------------------------------------------------------
-Write-Host ""
-Write-Status "--- Validation Summary ---" "INFO"
-Write-Host "  Source Subscription : $SourceSubscriptionId"
-Write-Host "  Source Resource Group: $SourceResourceGroupName"
-Write-Host "  Target Resource Group: $TargetResourceGroupId"
-Write-Host "  Resources Validated  : $($ResourceIds.Count)"
-Write-Host ""
-Write-Status "Script completed." "SUCCESS"
+# Returns $true if a resource ID is top-level (not a child resource).
+# Top-level: .../providers/Namespace/Type/Name  (3 segments after 'providers')
+# Child    : .../providers/Namespace/Type/Name/SubType/SubName  (5+ segments)
+function Test-IsTopLevelResource {
+    param([string]$ResourceId)
+    $parts        = $ResourceId.ToLower() -split '/'
+    $providerIdx  = [Array]::IndexOf($parts, 'providers')
+    if ($providerIdx -lt 0) { return $false }
+    return ($parts.Count - $providerIdx - 1) -le 3
+}
+
+# Retrieves and filters the resource list to top-level resources only.
+function Get-TopLevelResourceIds {
+    param(
+        [string]   $SubscriptionId,
+        [string]   $ResourceGroupName,
+        [string[]] $ExplicitIds
+    )
+
+    if (-not $ExplicitIds -or $ExplicitIds.Count -eq 0) {
+        Write-Status "Retrieving all resources in '$ResourceGroupName'..."
+        $all = Get-AzResource -ResourceGroupName $ResourceGroupName -ErrorAction Stop
+        if (-not $all -or $all.Count -eq 0) {
+            Write-Status "No resources found in '$ResourceGroupName'." "WARNING"
+            return @()
+        }
+        $ids = $all | Select-Object -ExpandProperty ResourceId
+    }
+    else {
+        $ids = $ExplicitIds
+    }
+
+    $topLevel = @($ids | Where-Object { Test-IsTopLevelResource $_ })
+    $skipped  = $ids.Count - $topLevel.Count
+
+    if ($skipped -gt 0) {
+        Write-Status "$skipped child resource(s) excluded (moved automatically with their parent)." "WARNING"
+        $ids | Where-Object { -not (Test-IsTopLevelResource $_) } |
+            ForEach-Object { Write-Host "  Skipped (child): $_" -ForegroundColor DarkYellow }
+    }
+
+    Write-Status "$($topLevel.Count) top-level resource(s) identified." "SUCCESS"
+    return $topLevel
+}
+
+# =============================================================================
+# FUNCTION: VALIDATE
+# Calls validateMoveResources against the source RG. No resources are moved.
+# =============================================================================
+
+function Invoke-Validate {
+    param(
+        [string]   $SubscriptionId,
+        [string]   $ResourceGroupName,
+        [string]   $TargetRgId,
+        [string]   $TargetSubId,
+        [string[]] $ResourceIds
+    )
+
+    Write-Banner "VALIDATE"
+
+    Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
+    Write-Status "Context set to subscription: $SubscriptionId" "SUCCESS"
+
+    $ids = Get-TopLevelResourceIds -SubscriptionId $SubscriptionId `
+                                   -ResourceGroupName $ResourceGroupName `
+                                   -ExplicitIds $ResourceIds
+    if ($ids.Count -eq 0) { return $false }
+
+    $payload = @{
+        resources           = @($ids)
+        targetResourceGroup = $TargetRgId
+    }
+
+    Write-Status "Payload preview:"
+    Write-Host ($payload | ConvertTo-Json -Depth 5) -ForegroundColor DarkGray
+
+    $sourceRgId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName"
+
+    Write-Status "Calling validateMoveResources - this can take up to 15 minutes..."
+
+    try {
+        $result = Invoke-AzResourceAction `
+            -ResourceId  $sourceRgId `
+            -Action      "validateMoveResources" `
+            -Parameters  $payload `
+            -ApiVersion  "2021-04-01" `
+            -Force `
+            -ErrorAction Stop
+
+        Write-Status "Validation PASSED - all resources are eligible to move." "SUCCESS"
+        Write-Output $result
+        return $true
+    }
+    catch {
+        Write-Status "Validation FAILED." "ERROR"
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            try {
+                $body = $_.ErrorDetails.Message | ConvertFrom-Json
+                if ($body.error.details) {
+                    foreach ($d in $body.error.details) {
+                        Write-Host "  Resource : $($d.target)"  -ForegroundColor Red
+                        Write-Host "  Code     : $($d.code)"    -ForegroundColor Red
+                        Write-Host "  Message  : $($d.message)" -ForegroundColor Red
+                        Write-Host ""
+                    }
+                }
+                else {
+                    Write-Host "  Code    : $($body.error.code)"    -ForegroundColor Red
+                    Write-Host "  Message : $($body.error.message)" -ForegroundColor Red
+                }
+            }
+            catch {
+                Write-Host $_.Exception.Message -ForegroundColor Red
+            }
+        }
+        return $false
+    }
+}
+
+# =============================================================================
+# FUNCTION: MOVE
+# Runs Validate first. On success, prompts for confirmation then moves resources
+# using Move-AzResource.
+# =============================================================================
+
+function Invoke-Move {
+    param(
+        [string]   $SubscriptionId,
+        [string]   $ResourceGroupName,
+        [string]   $TargetRgId,
+        [string]   $TargetSubId,
+        [string[]] $ResourceIds,
+        [bool]     $ForceMove
+    )
+
+    Write-Banner "MOVE"
+
+    # Always validate before moving
+    Write-Status "Running pre-move validation..."
+    $valid = Invoke-Validate -SubscriptionId   $SubscriptionId `
+                             -ResourceGroupName $ResourceGroupName `
+                             -TargetRgId        $TargetRgId `
+                             -TargetSubId       $TargetSubId `
+                             -ResourceIds       $ResourceIds
+    if (-not $valid) {
+        Write-Status "Move aborted - validation failed. Resolve the errors above and retry." "ERROR"
+        exit 1
+    }
+
+    # Re-fetch the filtered ID list for the actual move
+    Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
+    $ids = Get-TopLevelResourceIds -SubscriptionId $SubscriptionId `
+                                   -ResourceGroupName $ResourceGroupName `
+                                   -ExplicitIds $ResourceIds
+
+    # Parse target RG name and subscription from the target resource ID
+    # Expected format: /subscriptions/<subId>/resourceGroups/<rgName>
+    $targetParts  = $TargetRgId -split '/'
+    $targetRgName = $targetParts[-1]
+    $targetSubId  = if ($TargetSubId) { $TargetSubId } else {
+                        $targetParts | Select-Object -Index 2
+                    }
+
+    Write-Host ""
+    Write-Host "  Source RG     : $ResourceGroupName ($SubscriptionId)" -ForegroundColor White
+    Write-Host "  Target RG     : $targetRgName ($targetSubId)"         -ForegroundColor White
+    Write-Host "  Resources     : $($ids.Count)"                        -ForegroundColor White
+    Write-Host ""
+
+    if (-not $ForceMove) {
+        $confirm = Read-Host "Proceed with move? This cannot be undone. [yes/NO]"
+        if ($confirm -ne "yes") {
+            Write-Status "Move cancelled by user." "WARNING"
+            exit 0
+        }
+    }
+
+    Write-Status "Moving $($ids.Count) resource(s)..."
+
+    try {
+        $moveParams = @{
+            ResourceId                  = $ids
+            DestinationResourceGroupName = $targetRgName
+            ErrorAction                 = "Stop"
+        }
+        if ($targetSubId -and $targetSubId -ne $SubscriptionId) {
+            $moveParams["DestinationSubscriptionId"] = $targetSubId
+        }
+
+        Move-AzResource @moveParams -Force:$ForceMove
+
+        Write-Status "Move completed successfully." "SUCCESS"
+    }
+    catch {
+        Write-Status "Move failed: $($_.Exception.Message)" "ERROR"
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            Write-Host $_.ErrorDetails.Message -ForegroundColor Red
+        }
+        exit 1
+    }
+}
+
+# =============================================================================
+# FUNCTION: COPY
+# Exports the resource group as an ARM template (JSON) then decompiles it to
+# Bicep using the Azure CLI (az bicep decompile).
+# Output: $OutputPath\<resourceGroupName>.json + <resourceGroupName>.bicep
+# =============================================================================
+
+function Invoke-Copy {
+    param(
+        [string]   $SubscriptionId,
+        [string]   $ResourceGroupName,
+        [string[]] $ResourceIds,
+        [string]   $OutputDir
+    )
+
+    Write-Banner "COPY (EXPORT TO BICEP)"
+
+    # Ensure output directory exists
+    if (-not (Test-Path $OutputDir)) {
+        New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+        Write-Status "Created output directory: $OutputDir" "SUCCESS"
+    }
+    $OutputDir = (Resolve-Path $OutputDir).Path
+
+    Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
+    Write-Status "Context set to subscription: $SubscriptionId" "SUCCESS"
+
+    # ---- Step 1: Export ARM template ----
+    $jsonFile = Join-Path $OutputDir "$ResourceGroupName.json"
+    Write-Status "Exporting ARM template for '$ResourceGroupName'..."
+
+    try {
+        $exportParams = @{
+            ResourceGroupName         = $ResourceGroupName
+            Path                      = $jsonFile
+            IncludeParameterDefaultValue = $true
+            SkipResourceNameEscaping  = $true
+            Force                     = $true
+            ErrorAction               = "Stop"
+        }
+
+        # If specific resource IDs were provided, scope the export to those resources
+        if ($ResourceIds -and $ResourceIds.Count -gt 0) {
+            $ids = Get-TopLevelResourceIds -SubscriptionId $SubscriptionId `
+                                           -ResourceGroupName $ResourceGroupName `
+                                           -ExplicitIds $ResourceIds
+            if ($ids.Count -gt 0) {
+                $exportParams["Resource"] = $ids
+            }
+        }
+
+        Export-AzResourceGroup @exportParams | Out-Null
+        Write-Status "ARM template exported to: $jsonFile" "SUCCESS"
+    }
+    catch {
+        Write-Status "Export failed: $($_.Exception.Message)" "ERROR"
+        exit 1
+    }
+
+    # ---- Step 2: Decompile ARM JSON to Bicep ----
+    Write-Status "Checking for Azure CLI and Bicep..."
+
+    $azCli = Get-Command az -ErrorAction SilentlyContinue
+    if (-not $azCli) {
+        Write-Status "Azure CLI ('az') not found in PATH. Install from https://aka.ms/installazurecliwindows to enable Bicep decompilation." "WARNING"
+        Write-Status "ARM template is available at: $jsonFile" "INFO"
+        return
+    }
+
+    # Ensure bicep is installed via az CLI
+    $bicepCheck = az bicep version 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Status "Bicep not installed. Installing via Azure CLI..." "WARNING"
+        az bicep install 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Status "Bicep installation failed. ARM template is still available at: $jsonFile" "WARNING"
+            return
+        }
+        Write-Status "Bicep installed successfully." "SUCCESS"
+    }
+    else {
+        Write-Status "Bicep found: $($bicepCheck -join '')" "SUCCESS"
+    }
+
+    $bicepFile = [System.IO.Path]::ChangeExtension($jsonFile, ".bicep")
+    Write-Status "Decompiling ARM template to Bicep..."
+
+    az bicep decompile --file $jsonFile 2>&1 | ForEach-Object {
+        Write-Host "  [az] $_" -ForegroundColor DarkGray
+    }
+
+    if ($LASTEXITCODE -eq 0 -and (Test-Path $bicepFile)) {
+        Write-Status "Bicep file created: $bicepFile" "SUCCESS"
+    }
+    else {
+        Write-Status "Decompilation produced warnings or errors. Check the output above." "WARNING"
+        Write-Status "ARM template is still available at: $jsonFile" "INFO"
+    }
+
+    # ---- Step 3: Summary ----
+    Write-Host ""
+    Write-Status "--- Export Summary ---" "INFO"
+    Write-Host "  Output directory : $OutputDir"
+    Get-ChildItem -Path $OutputDir | ForEach-Object {
+        Write-Host "  $($_.Name)  ($([math]::Round($_.Length / 1KB, 1)) KB)" -ForegroundColor Green
+    }
+}
+
+# =============================================================================
+# ENTRY POINT - Validate shared prerequisites then dispatch to the right function
+# =============================================================================
+
+Write-Banner "AzResourceMover | Function: $Function"
+
+Assert-Module "Az.Resources"
+Connect-IfNeeded
+
+# Enforce required parameters per function
+if ($Function -in @("Validate", "Move")) {
+    if (-not $TargetResourceGroupId) {
+        Write-Status "-TargetResourceGroupId is required for the $Function function." "ERROR"
+        exit 1
+    }
+    if (-not $TargetSubscriptionId) {
+        $TargetSubscriptionId = $SourceSubscriptionId
+        Write-Status "No -TargetSubscriptionId provided - defaulting to source subscription." "WARNING"
+    }
+}
+
+switch ($Function) {
+    "Validate" {
+        Invoke-Validate -SubscriptionId    $SourceSubscriptionId `
+                        -ResourceGroupName $SourceResourceGroupName `
+                        -TargetRgId        $TargetResourceGroupId `
+                        -TargetSubId       $TargetSubscriptionId `
+                        -ResourceIds       $ResourceIds
+    }
+    "Move" {
+        Invoke-Move     -SubscriptionId    $SourceSubscriptionId `
+                        -ResourceGroupName $SourceResourceGroupName `
+                        -TargetRgId        $TargetResourceGroupId `
+                        -TargetSubId       $TargetSubscriptionId `
+                        -ResourceIds       $ResourceIds `
+                        -ForceMove         $Force.IsPresent
+    }
+    "Copy" {
+        Invoke-Copy     -SubscriptionId    $SourceSubscriptionId `
+                        -ResourceGroupName $SourceResourceGroupName `
+                        -ResourceIds       $ResourceIds `
+                        -OutputDir         $OutputPath
+    }
+}
