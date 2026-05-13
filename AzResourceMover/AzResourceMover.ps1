@@ -168,53 +168,61 @@ function Invoke-Validate {
                                    -ExplicitIds $ResourceIds
     if ($ids.Count -eq 0) { return $false }
 
-    $payload = @{
-        resources           = @($ids)
+    # Build the JSON body manually so the 'resources' property serializes as a
+    # flat string array. Invoke-AzResourceAction serializes hashtables internally
+    # and can wrap nested arrays in an extra object layer, causing the
+    # "Unexpected character encountered while parsing value: {" error.
+    $bodyObj = [ordered]@{
+        resources           = [array]$ids
         targetResourceGroup = $TargetRgId
     }
+    $jsonBody = $bodyObj | ConvertTo-Json -Depth 5 -Compress
 
     Write-Status "Payload preview:"
-    Write-Host ($payload | ConvertTo-Json -Depth 5) -ForegroundColor DarkGray
+    Write-Host ($bodyObj | ConvertTo-Json -Depth 5) -ForegroundColor DarkGray
 
-    $sourceRgId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName"
+    # REST path for validateMoveResources
+    $apiPath = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/" +
+               "validateMoveResources?api-version=2021-04-01"
 
     Write-Status "Calling validateMoveResources - this can take up to 15 minutes..."
 
     try {
-        $result = Invoke-AzResourceAction `
-            -ResourceId  $sourceRgId `
-            -Action      "validateMoveResources" `
-            -Parameters  $payload `
-            -ApiVersion  "2021-04-01" `
-            -Force `
+        $response = Invoke-AzRestMethod `
+            -Path    $apiPath `
+            -Method  POST `
+            -Payload $jsonBody `
             -ErrorAction Stop
 
-        Write-Status "Validation PASSED - all resources are eligible to move." "SUCCESS"
-        Write-Output $result
-        return $true
-    }
-    catch {
-        Write-Status "Validation FAILED." "ERROR"
-        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
-            try {
-                $body = $_.ErrorDetails.Message | ConvertFrom-Json
-                if ($body.error.details) {
-                    foreach ($d in $body.error.details) {
-                        Write-Host "  Resource : $($d.target)"  -ForegroundColor Red
-                        Write-Host "  Code     : $($d.code)"    -ForegroundColor Red
-                        Write-Host "  Message  : $($d.message)" -ForegroundColor Red
-                        Write-Host ""
-                    }
-                }
-                else {
-                    Write-Host "  Code    : $($body.error.code)"    -ForegroundColor Red
-                    Write-Host "  Message : $($body.error.message)" -ForegroundColor Red
-                }
-            }
-            catch {
-                Write-Host $_.Exception.Message -ForegroundColor Red
+        # 202 = Accepted (async), 204 = No Content (sync pass) - both mean success
+        if ($response.StatusCode -in @(202, 204)) {
+            Write-Status "Validation PASSED - all resources are eligible to move." "SUCCESS"
+            return $true
+        }
+
+        # Any other status code is treated as a failure; parse the error body
+        $errBody = $response.Content | ConvertFrom-Json -ErrorAction SilentlyContinue
+        Write-Status "Validation FAILED. HTTP $($response.StatusCode)." "ERROR"
+
+        if ($errBody.error.details) {
+            foreach ($d in $errBody.error.details) {
+                Write-Host "  Resource : $($d.target)"  -ForegroundColor Red
+                Write-Host "  Code     : $($d.code)"    -ForegroundColor Red
+                Write-Host "  Message  : $($d.message)" -ForegroundColor Red
+                Write-Host ""
             }
         }
+        elseif ($errBody.error) {
+            Write-Host "  Code    : $($errBody.error.code)"    -ForegroundColor Red
+            Write-Host "  Message : $($errBody.error.message)" -ForegroundColor Red
+        }
+        else {
+            Write-Host $response.Content -ForegroundColor Red
+        }
+        return $false
+    }
+    catch {
+        Write-Status "Validation request failed: $($_.Exception.Message)" "ERROR"
         return $false
     }
 }
