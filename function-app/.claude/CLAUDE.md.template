@@ -1,0 +1,6 @@
+TEMPLATE
+# Project: function-app
+
+## Development Workflow
+This project uses a multi-agent SDLC pipeline via Claude Code.
+- Run `/architect' to define the Azure Landing Zone

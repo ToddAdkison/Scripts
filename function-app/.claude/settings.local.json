@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh api *)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(mkdir -p ~/.claude/skills/azure-architecture)",
+      "Bash(curl -s -o ~/.claude/skills/azure-architecture/SKILL.md https://raw.githubusercontent.com/MicrosoftDocs/Agent-Skills/main/skills/azure-architecture/SKILL.md)",
+      "Read(//home/todda/.claude/skills/azure-architecture/**)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(git clone *)"
+    ]
+  }
+}
